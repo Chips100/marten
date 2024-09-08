@@ -1,6 +1,8 @@
 using System;
 using System.Threading.Tasks;
+using JasperFx.Core;
 using Marten;
+using Marten.Events;
 using Marten.Events.Daemon.Resiliency;
 using Marten.Events.Projections;
 using Marten.Events.Projections.Flattened;
@@ -9,11 +11,19 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace EventSourcingTests.Bugs;
 
 public class Bug_2865_configuration_assertion_with_flat_table_projections
 {
+    private readonly ITestOutputHelper _output;
+
+    public Bug_2865_configuration_assertion_with_flat_table_projections(ITestOutputHelper output)
+    {
+        _output = output;
+    }
+
     [Fact]
     public async Task should_be_able_to_assert_on_existence_of_flat_table_functions()
     {
@@ -56,12 +66,76 @@ public class Bug_2865_configuration_assertion_with_flat_table_projections
 
         await app.StopAsync();
     }
+
+    [Fact]
+    public async Task bug_3400_using_nullable_guid()
+    {
+        var appBuilder = Host.CreateApplicationBuilder();
+
+        appBuilder.Logging
+            .SetMinimumLevel(LogLevel.Information)
+            .AddFilter("Marten", LogLevel.Debug);
+
+        appBuilder.Services.AddMarten(options =>
+            {
+                options.Logger(new TestOutputMartenLogger(_output));
+
+                options.DisableNpgsqlLogging = true;
+                options.Connection(ConnectionSource.ConnectionString);
+                options.DatabaseSchemaName = "flat_projections";
+
+                options.Projections.Add<FlatImportProjection>(ProjectionLifecycle.Async);
+            })
+            // Add this
+            .ApplyAllDatabaseChangesOnStartup()
+            .UseLightweightSessions()
+            .OptimizeArtifactWorkflow()
+            .AddAsyncDaemon(DaemonMode.Solo);
+
+        var app = appBuilder.Build();
+        await app.DocumentStore().Advanced.Clean.DeleteAllDocumentsAsync();
+        await app.DocumentStore().Advanced.Clean.DeleteAllEventDataAsync();
+
+        await app.StartAsync();
+
+        var store = app.Services.GetRequiredService<IDocumentStore>();
+
+// ########## Uncomment the next line to get the error ##########
+        await store.Storage.Database.AssertDatabaseMatchesConfigurationAsync();
+
+        await using (var session = store.LightweightSession())
+        {
+            var id = Guid.NewGuid();
+            var startTime = DateTimeOffset.Now.AddMinutes(-1).ToUniversalTime();
+            session.Events.StartStream(id,
+                new ImportStarted(startTime, "foo", "cust-1", 3),
+                new ImportProgress("step-1", 3, 1),
+                new ImportFinished(DateTimeOffset.UtcNow.ToUniversalTime())
+
+                );
+
+            await session.SaveChangesAsync();
+
+            session.Events.Append(id, new ImportFailedWithGuidErrorCode(null));
+            await session.SaveChangesAsync();
+        }
+
+
+        await app.WaitForNonStaleProjectionDataAsync(30.Seconds());
+
+        await app.StopAsync();
+    }
 }
 
 public record ImportStarted(DateTimeOffset Started, string ActivityType, string CustomerId, int PlannedSteps);
 public record ImportProgress(string StepName, int Records, int Invalids);
 public record ImportFinished(DateTimeOffset Finished);
 public record ImportFailed;
+
+public record ImportFailedWithStringErrorCode(string? ErrorCodeString);
+
+public record ImportFailedWithGuidErrorCode(Guid? ErrorCodeGuid);
+
 
 public class FlatImportProjection : FlatTableProjection
 {
@@ -104,9 +178,20 @@ public class FlatImportProjection : FlatTableProjection
 
         Project<ImportFinished>(map =>
         {
-            map.Map(x => x.Finished);
+            //map.Map(x => x.Finished);
             map.SetValue("status", "completed");
         });
+
+        Project<ImportFailedWithStringErrorCode>(map =>
+        {
+            map.Map(x => x.ErrorCodeString);
+        });
+
+        Project<ImportFailedWithGuidErrorCode>(map =>
+        {
+            map.Map(x => x.ErrorCodeGuid);
+        });
+
 
         // Just gonna delete the record of any failures
         Delete<ImportFailed>();

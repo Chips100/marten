@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using JasperFx.CodeGeneration;
@@ -35,6 +36,11 @@ public partial class FlatTableProjection
 
     protected override bool tryAttachTypes(Assembly assembly, StoreOptions options)
     {
+        if (_projectionType != null)
+        {
+            Debug.WriteLine(_projectionType.SourceCode);
+        }
+
         _generatedType = assembly.GetExportedTypes().FirstOrDefault(x => x.Name == _inlineTypeName);
         return _generatedType != null;
     }
